@@ -1,0 +1,14 @@
+# Binaries
+/vault
+*.exe
+
+# Vault data (NEVER commit secrets)
+*.enc
+key
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
