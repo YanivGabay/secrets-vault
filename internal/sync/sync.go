@@ -51,6 +51,25 @@ func homeDir() string {
 	return home
 }
 
+// FilterKeys returns only the secrets whose keys are in the allowlist.
+// If allowlist is empty, returns all secrets unchanged.
+func FilterKeys(secrets map[string]string, keys []string) map[string]string {
+	if len(keys) == 0 {
+		return secrets
+	}
+	allowed := make(map[string]bool, len(keys))
+	for _, k := range keys {
+		allowed[k] = true
+	}
+	filtered := make(map[string]string, len(keys))
+	for k, v := range secrets {
+		if allowed[k] {
+			filtered[k] = v
+		}
+	}
+	return filtered
+}
+
 func FormatResults(results []Result) string {
 	var b strings.Builder
 	for _, r := range results {

@@ -9,9 +9,15 @@ import (
 
 type Cloudflare struct {
 	ProjectDir string // path to the wrangler project
+	WorkerName string // --name flag: target a specific worker instead of default config
 }
 
-func (c *Cloudflare) Name() string { return "cloudflare" }
+func (c *Cloudflare) Name() string {
+	if c.WorkerName != "" {
+		return "cloudflare:" + c.WorkerName
+	}
+	return "cloudflare"
+}
 
 func (c *Cloudflare) Sync(project string, secrets map[string]string) error {
 	dir := c.ProjectDir
@@ -20,7 +26,12 @@ func (c *Cloudflare) Sync(project string, secrets map[string]string) error {
 	}
 
 	for key, value := range secrets {
-		cmd := exec.Command("wrangler", "secret", "put", key)
+		args := []string{"secret", "put", key}
+		if c.WorkerName != "" {
+			args = append(args, "--name", c.WorkerName)
+		}
+
+		cmd := exec.Command("wrangler", args...)
 		cmd.Dir = dir
 		cmd.Stdin = strings.NewReader(value)
 

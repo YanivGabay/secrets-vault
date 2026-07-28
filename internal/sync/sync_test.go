@@ -165,3 +165,39 @@ func TestDotEnv_Overwrite(t *testing.T) {
 		t.Fatal("new key missing after overwrite")
 	}
 }
+
+func TestFilterKeys_Allowlist(t *testing.T) {
+	secrets := map[string]string{"A": "1", "B": "2", "C": "3", "D": "4"}
+
+	filtered := FilterKeys(secrets, []string{"A", "C"})
+	if len(filtered) != 2 {
+		t.Fatalf("filtered count = %d, want 2", len(filtered))
+	}
+	if filtered["A"] != "1" || filtered["C"] != "3" {
+		t.Fatalf("wrong values: %v", filtered)
+	}
+	if _, ok := filtered["B"]; ok {
+		t.Fatal("B should be filtered out")
+	}
+}
+
+func TestFilterKeys_EmptyAllowlist(t *testing.T) {
+	secrets := map[string]string{"A": "1", "B": "2"}
+	filtered := FilterKeys(secrets, nil)
+	if len(filtered) != 2 {
+		t.Fatal("empty allowlist should return all keys")
+	}
+
+	filtered2 := FilterKeys(secrets, []string{})
+	if len(filtered2) != 2 {
+		t.Fatal("zero-length allowlist should return all keys")
+	}
+}
+
+func TestFilterKeys_NoMatch(t *testing.T) {
+	secrets := map[string]string{"A": "1", "B": "2"}
+	filtered := FilterKeys(secrets, []string{"X", "Y"})
+	if len(filtered) != 0 {
+		t.Fatal("expected empty result for non-matching keys")
+	}
+}

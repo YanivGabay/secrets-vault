@@ -353,3 +353,61 @@ func TestCLI_SyncFromManifest(t *testing.T) {
 		t.Fatalf("secret not synced via manifest: %s", data)
 	}
 }
+
+func TestCLI_SyncWithKeysFilter(t *testing.T) {
+	bin := buildBinary(t)
+	dir := t.TempDir()
+	runVault(t, bin, dir, "init")
+
+	envFile := filepath.Join(t.TempDir(), ".env")
+	os.WriteFile(envFile, []byte("API_KEY=abc\nDB_URL=postgres\nDEBUG=true\n"), 0644)
+	runVault(t, bin, dir, "import", "app", envFile)
+
+	syncDir := t.TempDir()
+	out, err := runVault(t, bin, dir, "sync", "app", "env", "--dir", syncDir, "--keys", "API_KEY,DB_URL")
+	if err != nil {
+		t.Fatalf("sync with --keys failed: %s: %v", out, err)
+	}
+
+	data, _ := os.ReadFile(filepath.Join(syncDir, ".env"))
+	content := string(data)
+	if !strings.Contains(content, "API_KEY=") {
+		t.Fatal("API_KEY missing from filtered sync")
+	}
+	if !strings.Contains(content, "DB_URL=") {
+		t.Fatal("DB_URL missing from filtered sync")
+	}
+	if strings.Contains(content, "DEBUG=") {
+		t.Fatal("DEBUG should have been filtered out by --keys")
+	}
+}
+
+func TestCLI_SyncManifestWithKeysFilter(t *testing.T) {
+	bin := buildBinary(t)
+	vaultDir := t.TempDir()
+	runVault(t, bin, vaultDir, "init")
+
+	projectDir := t.TempDir()
+	os.WriteFile(filepath.Join(projectDir, ".env"), []byte("SAFE_KEY=ok\nDANGEROUS_TOKEN=nope\n"), 0644)
+	runVault(t, bin, vaultDir, "onboard", projectDir)
+
+	// Rewrite manifest with key allowlist
+	projectName := filepath.Base(projectDir)
+	syncDir := t.TempDir()
+	manifest := `{"project":"` + projectName + `","keys":["SAFE_KEY","DANGEROUS_TOKEN"],"sync":{"env":{"dir":"` + syncDir + `","keys":["SAFE_KEY"]}}}`
+	os.WriteFile(filepath.Join(projectDir, ".vault.json"), []byte(manifest), 0644)
+
+	out, err := runVault(t, bin, vaultDir, "sync", projectDir)
+	if err != nil {
+		t.Fatalf("manifest sync failed: %s: %v", out, err)
+	}
+
+	data, _ := os.ReadFile(filepath.Join(syncDir, ".env"))
+	content := string(data)
+	if !strings.Contains(content, "SAFE_KEY=") {
+		t.Fatal("SAFE_KEY missing")
+	}
+	if strings.Contains(content, "DANGEROUS_TOKEN") {
+		t.Fatal("DANGEROUS_TOKEN should have been filtered out by manifest keys allowlist")
+	}
+}

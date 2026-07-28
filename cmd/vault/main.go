@@ -71,12 +71,19 @@ Commands:
   rm  <project> <KEY>           Remove a secret
   list [project]                List projects or keys
   sync <project> <target>       Sync to target (github, cloudflare, env)
+  sync <dir>                    Sync using .vault.json manifest
   import <project> <.env path>  Import secrets from .env file
   onboard [dir]                 Auto-detect .env files, import, create .vault.json
 
 Add flags:
   --stdin                       Read value from stdin pipe
-  --prompt                      Prompt for value in terminal (hidden input)`)
+  --prompt                      Prompt for value in terminal (hidden input)
+
+Sync flags:
+  --repo owner/repo             GitHub repo to sync to
+  --name worker-name            Cloudflare Worker name to target
+  --dir /path                   Project directory for cloudflare/env sync
+  --keys KEY1,KEY2              Only sync these keys (default: all)`)
 }
 
 func cmdInit(v *vault.Vault) error {
@@ -200,6 +207,14 @@ func cmdSync(v *vault.Vault) error {
 		return err
 	}
 
+	// Filter keys if --keys flag is provided
+	if keysFlag := flagValue("--keys"); keysFlag != "" {
+		secrets = sync.FilterKeys(secrets, strings.Split(keysFlag, ","))
+		if len(secrets) == 0 {
+			return fmt.Errorf("no matching keys found for filter")
+		}
+	}
+
 	var target sync.Target
 	switch targetName {
 	case "github", "gh":
@@ -212,6 +227,9 @@ func cmdSync(v *vault.Vault) error {
 		cf := &sync.Cloudflare{}
 		if dir := flagValue("--dir"); dir != "" {
 			cf.ProjectDir = dir
+		}
+		if name := flagValue("--name"); name != "" {
+			cf.WorkerName = name
 		}
 		target = cf
 	case "env", "dotenv":
@@ -270,11 +288,31 @@ func cmdImport(v *vault.Vault) error {
 	return nil
 }
 
+// SyncTarget is the per-target config in .vault.json.
+// Accepts either a string (shorthand) or an object with dir/name/repo fields.
+type SyncTarget struct {
+	Dir  string   `json:"dir,omitempty"`
+	Name string   `json:"name,omitempty"` // worker name for cloudflare
+	Repo string   `json:"repo,omitempty"` // owner/repo for github
+	Keys []string `json:"keys,omitempty"` // allowlist — only sync these keys (empty = all)
+}
+
+func (s *SyncTarget) UnmarshalJSON(data []byte) error {
+	var str string
+	if json.Unmarshal(data, &str) == nil {
+		s.Repo = str
+		s.Dir = str
+		return nil
+	}
+	type alias SyncTarget
+	return json.Unmarshal(data, (*alias)(s))
+}
+
 // Manifest is the .vault.json schema that lives in each project repo.
 type Manifest struct {
-	Project string            `json:"project"`
-	Keys    []string          `json:"keys"`
-	Sync    map[string]string `json:"sync,omitempty"` // target → config (e.g. "github": "owner/repo")
+	Project string                `json:"project"`
+	Keys    []string              `json:"keys"`
+	Sync    map[string]SyncTarget `json:"sync,omitempty"`
 }
 
 func cmdOnboard(v *vault.Vault) error {
@@ -340,18 +378,18 @@ func cmdOnboard(v *vault.Vault) error {
 	manifest := Manifest{
 		Project: project,
 		Keys:    keys,
-		Sync:    map[string]string{},
+		Sync:    map[string]SyncTarget{},
 	}
 
 	// Auto-detect sync targets
 	if _, err := os.Stat(filepath.Join(absDir, ".github")); err == nil {
-		manifest.Sync["github"] = ""
+		manifest.Sync["github"] = SyncTarget{}
 	}
 	if _, err := os.Stat(filepath.Join(absDir, "wrangler.toml")); err == nil {
-		manifest.Sync["cloudflare"] = ""
+		manifest.Sync["cloudflare"] = SyncTarget{}
 	}
 	if _, err := os.Stat(filepath.Join(absDir, "wrangler.jsonc")); err == nil {
-		manifest.Sync["cloudflare"] = ""
+		manifest.Sync["cloudflare"] = SyncTarget{}
 	}
 
 	manifestData, _ := json.MarshalIndent(manifest, "", "  ")
@@ -385,34 +423,45 @@ func cmdSyncFromManifest(v *vault.Vault, absDir string) error {
 		return err
 	}
 
-	var targets []sync.Target
-	for targetName, config := range m.Sync {
+	type targetWithKeys struct {
+		target sync.Target
+		keys   []string
+	}
+
+	var pairs []targetWithKeys
+	for targetName, cfg := range m.Sync {
 		switch targetName {
 		case "github":
-			targets = append(targets, &sync.GitHub{Repo: config})
+			pairs = append(pairs, targetWithKeys{&sync.GitHub{Repo: cfg.Repo}, cfg.Keys})
 		case "cloudflare":
 			dir := absDir
-			if config != "" {
-				dir = config
+			if cfg.Dir != "" {
+				dir = cfg.Dir
 			}
-			targets = append(targets, &sync.Cloudflare{ProjectDir: dir})
+			pairs = append(pairs, targetWithKeys{&sync.Cloudflare{ProjectDir: dir, WorkerName: cfg.Name}, cfg.Keys})
 		case "env":
 			dir := absDir
-			if config != "" {
-				dir = config
+			if cfg.Dir != "" {
+				dir = cfg.Dir
 			}
-			targets = append(targets, &sync.DotEnv{ProjectDir: dir})
+			pairs = append(pairs, targetWithKeys{&sync.DotEnv{ProjectDir: dir}, cfg.Keys})
 		}
 	}
 
-	if len(targets) == 0 {
+	if len(pairs) == 0 {
 		return fmt.Errorf("no sync targets defined in .vault.json")
 	}
 
-	results := sync.All(m.Project, secrets, targets...)
-	fmt.Print(sync.FormatResults(results))
+	var allResults []sync.Result
+	for _, p := range pairs {
+		filtered := sync.FilterKeys(secrets, p.keys)
+		results := sync.All(m.Project, filtered, p.target)
+		allResults = append(allResults, results...)
+	}
 
-	for _, r := range results {
+	fmt.Print(sync.FormatResults(allResults))
+
+	for _, r := range allResults {
 		if r.Err != nil {
 			return fmt.Errorf("sync had failures")
 		}
