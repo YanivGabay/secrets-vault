@@ -197,6 +197,53 @@ func TestCLI_MissingArgs(t *testing.T) {
 	}
 }
 
+func TestCLI_GetValue(t *testing.T) {
+	bin := buildBinary(t)
+	dir := t.TempDir()
+	runVault(t, bin, dir, "init")
+
+	runVaultWithStdin(t, bin, dir, "my-secret-123", "add", "app", "TOKEN", "--stdin")
+
+	out, err := runVault(t, bin, dir, "get", "app", "TOKEN")
+	if err != nil {
+		t.Fatalf("get failed: %s: %v", out, err)
+	}
+	if out != "my-secret-123" {
+		t.Fatalf("got %q, want %q", out, "my-secret-123")
+	}
+}
+
+func TestCLI_GetValue_Pipe(t *testing.T) {
+	bin := buildBinary(t)
+	dir := t.TempDir()
+	runVault(t, bin, dir, "init")
+
+	runVaultWithStdin(t, bin, dir, "pipe-this-value", "add", "app", "KEY", "--stdin")
+
+	// Simulate piping: vault get | other-command
+	cmd := exec.Command("sh", "-c", bin+" get app KEY | wc -c")
+	cmd.Env = append(os.Environ(), "VAULT_DIR="+dir)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("pipe failed: %s: %v", out, err)
+	}
+	// "pipe-this-value" = 15 chars, no trailing newline
+	if !strings.Contains(strings.TrimSpace(string(out)), "15") {
+		t.Fatalf("expected 15 bytes piped, got: %s", out)
+	}
+}
+
+func TestCLI_GetValue_NotFound(t *testing.T) {
+	bin := buildBinary(t)
+	dir := t.TempDir()
+	runVault(t, bin, dir, "init")
+
+	_, err := runVault(t, bin, dir, "get", "nope", "MISSING")
+	if err == nil {
+		t.Fatal("expected error for nonexistent key")
+	}
+}
+
 func TestCLI_AddFromStdin(t *testing.T) {
 	bin := buildBinary(t)
 	dir := t.TempDir()

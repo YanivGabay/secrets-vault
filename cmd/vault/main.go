@@ -44,6 +44,8 @@ func main() {
 		err = cmdRemove(v)
 	case "list", "ls":
 		err = cmdList(v)
+	case "get":
+		err = cmdGet(v)
 	case "sync":
 		err = cmdSync(v)
 	case "import":
@@ -68,6 +70,7 @@ func usage() {
 Commands:
   init                          Create a new vault
   add <project> <KEY> [flags]   Add a secret (default: from clipboard)
+  get <project> <KEY>           Output secret value to stdout (for piping)
   rm  <project> <KEY>           Remove a secret
   list [project]                List projects or keys
   sync <project> <target>       Sync to target (github, cloudflare, env)
@@ -140,6 +143,22 @@ func cmdAdd(v *vault.Vault) error {
 	}
 
 	fmt.Printf("Added %s to %s\n", key, project)
+	return nil
+}
+
+func cmdGet(v *vault.Vault) error {
+	if len(os.Args) < 4 {
+		return fmt.Errorf("usage: vault get <project> <KEY>")
+	}
+	project, key := os.Args[2], os.Args[3]
+
+	value, err := v.Get(project, key)
+	if err != nil {
+		return err
+	}
+
+	// Raw value to stdout — no newline, so piping is clean
+	fmt.Print(value)
 	return nil
 }
 
