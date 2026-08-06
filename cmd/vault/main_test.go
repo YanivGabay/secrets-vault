@@ -401,6 +401,115 @@ func TestCLI_SyncFromManifest(t *testing.T) {
 	}
 }
 
+func TestCLI_ExportImportShare_RoundTrip(t *testing.T) {
+	bin := buildBinary(t)
+	// Sender vault
+	senderDir := t.TempDir()
+	runVault(t, bin, senderDir, "init")
+	runVaultWithStdin(t, bin, senderDir, "super-secret-value", "add", "myapp", "API_KEY", "--stdin")
+	runVaultWithStdin(t, bin, senderDir, "db-password-123", "add", "myapp", "DB_PASS", "--stdin")
+
+	// Export
+	shareFile := filepath.Join(t.TempDir(), "myapp.vault-share")
+	out, err := runVault(t, bin, senderDir, "export", "myapp", "--out", shareFile)
+	if err != nil {
+		t.Fatalf("export failed: %s: %v", out, err)
+	}
+
+	// The share code is printed to combined output (stdout+stderr)
+	// Extract the code — it's the XXXX-XXXX-... formatted string
+	lines := strings.Split(out, "\n")
+	shareCode := ""
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.Count(trimmed, "-") >= 3 && !strings.Contains(trimmed, " ") {
+			shareCode = trimmed
+		}
+	}
+	if shareCode == "" {
+		t.Fatalf("no share code found in output: %s", out)
+	}
+
+	// Verify the share file exists
+	if _, err := os.Stat(shareFile); err != nil {
+		t.Fatal("share file not created")
+	}
+
+	// Recipient vault
+	recipientDir := t.TempDir()
+	runVault(t, bin, recipientDir, "init")
+
+	// Import with the share code
+	out, err = runVault(t, bin, recipientDir, "import-share", shareFile, "--code", shareCode)
+	if err != nil {
+		t.Fatalf("import-share failed: %s: %v", out, err)
+	}
+	if !strings.Contains(out, "Imported 2 keys") {
+		t.Fatalf("unexpected import output: %s", out)
+	}
+
+	// Verify secrets are in recipient's vault
+	out, _ = runVault(t, bin, recipientDir, "list", "myapp")
+	if !strings.Contains(out, "API_KEY") || !strings.Contains(out, "DB_PASS") {
+		t.Fatalf("keys missing after import-share: %s", out)
+	}
+}
+
+func TestCLI_ExportWithKeysFilter(t *testing.T) {
+	bin := buildBinary(t)
+	dir := t.TempDir()
+	runVault(t, bin, dir, "init")
+	runVaultWithStdin(t, bin, dir, "val1", "add", "app", "KEEP", "--stdin")
+	runVaultWithStdin(t, bin, dir, "val2", "add", "app", "SKIP", "--stdin")
+
+	shareFile := filepath.Join(t.TempDir(), "filtered.vault-share")
+	out, err := runVault(t, bin, dir, "export", "app", "--keys", "KEEP", "--out", shareFile)
+	if err != nil {
+		t.Fatalf("export failed: %s: %v", out, err)
+	}
+	if !strings.Contains(out, "1 keys") {
+		t.Fatalf("expected 1 key exported: %s", out)
+	}
+
+	// Import and verify only KEEP was shared
+	recDir := t.TempDir()
+	runVault(t, bin, recDir, "init")
+	lines := strings.Split(out, "\n")
+	code := ""
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.Count(trimmed, "-") >= 3 && !strings.Contains(trimmed, " ") {
+			code = trimmed
+		}
+	}
+	out, _ = runVault(t, bin, recDir, "import-share", shareFile, "--code", code)
+	out, _ = runVault(t, bin, recDir, "list", "app")
+	if !strings.Contains(out, "KEEP") {
+		t.Fatal("KEEP should be imported")
+	}
+	if strings.Contains(out, "SKIP") {
+		t.Fatal("SKIP should NOT be imported")
+	}
+}
+
+func TestCLI_ImportShare_WrongCode(t *testing.T) {
+	bin := buildBinary(t)
+	dir := t.TempDir()
+	runVault(t, bin, dir, "init")
+	runVaultWithStdin(t, bin, dir, "secret", "add", "app", "KEY", "--stdin")
+
+	shareFile := filepath.Join(t.TempDir(), "test.vault-share")
+	runVault(t, bin, dir, "export", "app", "--out", shareFile)
+
+	recDir := t.TempDir()
+	runVault(t, bin, recDir, "init")
+
+	_, err := runVault(t, bin, recDir, "import-share", shareFile, "--code", "WRONG-CODE-HERE")
+	if err == nil {
+		t.Fatal("expected error for wrong share code")
+	}
+}
+
 func TestCLI_SyncWithKeysFilter(t *testing.T) {
 	bin := buildBinary(t)
 	dir := t.TempDir()

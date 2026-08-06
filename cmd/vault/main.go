@@ -12,7 +12,7 @@ import (
 	"strings"
 
 	"github.com/yaniv242/secrets-vault/internal/clipboard"
-	"github.com/yaniv242/secrets-vault/internal/sync"
+	syncpkg "github.com/yaniv242/secrets-vault/internal/sync"
 	"github.com/yaniv242/secrets-vault/internal/vault"
 )
 
@@ -50,6 +50,10 @@ func main() {
 		err = cmdSync(v)
 	case "import":
 		err = cmdImport(v)
+	case "export":
+		err = cmdExport(v)
+	case "import-share":
+		err = cmdImportShare(v)
 	case "onboard":
 		err = cmdOnboard(v)
 	default:
@@ -76,6 +80,8 @@ Commands:
   sync <project> <target>       Sync to target (github, cloudflare, env)
   sync <dir>                    Sync using .vault.json manifest
   import <project> <.env path>  Import secrets from .env file
+  export <project> [flags]      Export encrypted share file + share code
+  import-share <file>           Import from a .vault-share file
   onboard [dir]                 Auto-detect .env files, import, create .vault.json
 
 Add flags:
@@ -86,7 +92,14 @@ Sync flags:
   --repo owner/repo             GitHub repo to sync to
   --name worker-name            Cloudflare Worker name to target
   --dir /path                   Project directory for cloudflare/env sync
-  --keys KEY1,KEY2              Only sync these keys (default: all)`)
+  --keys KEY1,KEY2              Only sync these keys (default: all)
+
+Export flags:
+  --keys KEY1,KEY2              Only export these keys
+  --out <file>                  Output file (default: <project>.vault-share)
+
+Import-share flags:
+  --code XXXX-XXXX-...          Share code (or use --prompt to enter interactively)`)
 }
 
 func cmdInit(v *vault.Vault) error {
@@ -228,22 +241,22 @@ func cmdSync(v *vault.Vault) error {
 
 	// Filter keys if --keys flag is provided
 	if keysFlag := flagValue("--keys"); keysFlag != "" {
-		secrets = sync.FilterKeys(secrets, strings.Split(keysFlag, ","))
+		secrets = syncpkg.FilterKeys(secrets, strings.Split(keysFlag, ","))
 		if len(secrets) == 0 {
 			return fmt.Errorf("no matching keys found for filter")
 		}
 	}
 
-	var target sync.Target
+	var target syncpkg.Target
 	switch targetName {
 	case "github", "gh":
-		gh := &sync.GitHub{}
+		gh := &syncpkg.GitHub{}
 		if repo := flagValue("--repo"); repo != "" {
 			gh.Repo = repo
 		}
 		target = gh
 	case "cloudflare", "cf", "wrangler":
-		cf := &sync.Cloudflare{}
+		cf := &syncpkg.Cloudflare{}
 		if dir := flagValue("--dir"); dir != "" {
 			cf.ProjectDir = dir
 		}
@@ -252,7 +265,7 @@ func cmdSync(v *vault.Vault) error {
 		}
 		target = cf
 	case "env", "dotenv":
-		de := &sync.DotEnv{}
+		de := &syncpkg.DotEnv{}
 		if dir := flagValue("--dir"); dir != "" {
 			de.ProjectDir = dir
 		}
@@ -261,8 +274,8 @@ func cmdSync(v *vault.Vault) error {
 		return fmt.Errorf("unknown target: %s (use: github, cloudflare, env)", targetName)
 	}
 
-	results := sync.All(project, secrets, target)
-	fmt.Print(sync.FormatResults(results))
+	results := syncpkg.All(project, secrets, target)
+	fmt.Print(syncpkg.FormatResults(results))
 
 	for _, r := range results {
 		if r.Err != nil {
@@ -304,6 +317,124 @@ func cmdImport(v *vault.Vault) error {
 	}
 
 	fmt.Printf("Imported %d keys into %s\n", count, project)
+	return nil
+}
+
+// SharePayload is the JSON structure inside a .vault-share file.
+type SharePayload struct {
+	Project string            `json:"project"`
+	Secrets map[string]string `json:"secrets"`
+}
+
+func cmdExport(v *vault.Vault) error {
+	if len(os.Args) < 3 {
+		return fmt.Errorf("usage: vault export <project> [--keys KEY1,KEY2] [--out file]")
+	}
+	project := os.Args[2]
+
+	secrets, err := v.GetProject(project)
+	if err != nil {
+		return err
+	}
+
+	if keysFlag := flagValue("--keys"); keysFlag != "" {
+		secrets = syncpkg.FilterKeys(secrets, strings.Split(keysFlag, ","))
+		if len(secrets) == 0 {
+			return fmt.Errorf("no matching keys for filter")
+		}
+	}
+
+	code, err := vault.GenerateShareCode()
+	if err != nil {
+		return err
+	}
+
+	payload := SharePayload{Project: project, Secrets: secrets}
+	plaintext, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("marshal payload: %w", err)
+	}
+
+	ciphertext, err := vault.EncryptWithPassphrase(plaintext, code)
+	if err != nil {
+		return err
+	}
+
+	outFile := flagValue("--out")
+	if outFile == "" {
+		outFile = project + ".vault-share"
+	}
+
+	if err := os.WriteFile(outFile, ciphertext, 0644); err != nil {
+		return fmt.Errorf("write share file: %w", err)
+	}
+
+	keyNames := make([]string, 0, len(secrets))
+	for k := range secrets {
+		keyNames = append(keyNames, k)
+	}
+	slices.Sort(keyNames)
+
+	fmt.Fprintf(os.Stderr, "Exported %d keys from %s to %s\n", len(secrets), project, outFile)
+	fmt.Fprintf(os.Stderr, "Keys: %s\n", strings.Join(keyNames, ", "))
+	// Share code goes to stdout so Claude can capture it
+	fmt.Print(code)
+	return nil
+}
+
+func cmdImportShare(v *vault.Vault) error {
+	if len(os.Args) < 3 {
+		return fmt.Errorf("usage: vault import-share <file.vault-share> [--code XXXX-...] [--prompt]")
+	}
+	shareFile := os.Args[2]
+
+	data, err := os.ReadFile(shareFile)
+	if err != nil {
+		return fmt.Errorf("read share file: %w", err)
+	}
+
+	var code string
+	switch {
+	case flagValue("--code") != "":
+		code = flagValue("--code")
+	case hasFlag("--prompt"):
+		fmt.Fprint(os.Stderr, "Enter share code: ")
+		scanner := bufio.NewScanner(os.Stdin)
+		if scanner.Scan() {
+			code = scanner.Text()
+		}
+	default:
+		// Try stdin
+		stdinData, readErr := io.ReadAll(os.Stdin)
+		if readErr != nil {
+			return fmt.Errorf("read code from stdin: %w", readErr)
+		}
+		code = strings.TrimSpace(string(stdinData))
+	}
+
+	if code == "" {
+		return fmt.Errorf("share code required (use --code, --prompt, or pipe to stdin)")
+	}
+
+	plaintext, err := vault.DecryptWithPassphrase(data, code)
+	if err != nil {
+		return fmt.Errorf("invalid share code or corrupted file")
+	}
+
+	var payload SharePayload
+	if err := json.Unmarshal(plaintext, &payload); err != nil {
+		return fmt.Errorf("invalid share file format")
+	}
+
+	count := 0
+	for key, value := range payload.Secrets {
+		if err := v.Add(payload.Project, key, value); err != nil {
+			return fmt.Errorf("add %s: %w", key, err)
+		}
+		count++
+	}
+
+	fmt.Printf("Imported %d keys into %s\n", count, payload.Project)
 	return nil
 }
 
@@ -443,7 +574,7 @@ func cmdSyncFromManifest(v *vault.Vault, absDir string) error {
 	}
 
 	type targetWithKeys struct {
-		target sync.Target
+		target syncpkg.Target
 		keys   []string
 	}
 
@@ -451,19 +582,19 @@ func cmdSyncFromManifest(v *vault.Vault, absDir string) error {
 	for targetName, cfg := range m.Sync {
 		switch targetName {
 		case "github":
-			pairs = append(pairs, targetWithKeys{&sync.GitHub{Repo: cfg.Repo}, cfg.Keys})
+			pairs = append(pairs, targetWithKeys{&syncpkg.GitHub{Repo: cfg.Repo}, cfg.Keys})
 		case "cloudflare":
 			dir := absDir
 			if cfg.Dir != "" {
 				dir = cfg.Dir
 			}
-			pairs = append(pairs, targetWithKeys{&sync.Cloudflare{ProjectDir: dir, WorkerName: cfg.Name}, cfg.Keys})
+			pairs = append(pairs, targetWithKeys{&syncpkg.Cloudflare{ProjectDir: dir, WorkerName: cfg.Name}, cfg.Keys})
 		case "env":
 			dir := absDir
 			if cfg.Dir != "" {
 				dir = cfg.Dir
 			}
-			pairs = append(pairs, targetWithKeys{&sync.DotEnv{ProjectDir: dir}, cfg.Keys})
+			pairs = append(pairs, targetWithKeys{&syncpkg.DotEnv{ProjectDir: dir}, cfg.Keys})
 		}
 	}
 
@@ -471,14 +602,14 @@ func cmdSyncFromManifest(v *vault.Vault, absDir string) error {
 		return fmt.Errorf("no sync targets defined in .vault.json")
 	}
 
-	var allResults []sync.Result
+	var allResults []syncpkg.Result
 	for _, p := range pairs {
-		filtered := sync.FilterKeys(secrets, p.keys)
-		results := sync.All(m.Project, filtered, p.target)
+		filtered := syncpkg.FilterKeys(secrets, p.keys)
+		results := syncpkg.All(m.Project, filtered, p.target)
 		allResults = append(allResults, results...)
 	}
 
-	fmt.Print(sync.FormatResults(allResults))
+	fmt.Print(syncpkg.FormatResults(allResults))
 
 	for _, r := range allResults {
 		if r.Err != nil {

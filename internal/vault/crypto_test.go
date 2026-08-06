@@ -152,3 +152,73 @@ func TestDecrypt_TooShort(t *testing.T) {
 		t.Fatal("expected error for ciphertext shorter than nonce")
 	}
 }
+
+func TestGenerateShareCode(t *testing.T) {
+	code1, err := GenerateShareCode()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Should contain dashes in XXXX-XXXX-... format
+	parts := bytes.Count([]byte(code1), []byte("-"))
+	if parts < 3 {
+		t.Fatalf("share code should have dashes: %q", code1)
+	}
+
+	// Two codes should differ
+	code2, _ := GenerateShareCode()
+	if code1 == code2 {
+		t.Fatal("two share codes should not be equal")
+	}
+}
+
+func TestEncryptDecryptWithPassphrase(t *testing.T) {
+	plaintext := []byte(`{"project":"test","secrets":{"KEY":"value123"}}`)
+	passphrase := "TEST-CODE-1234"
+
+	ciphertext, err := EncryptWithPassphrase(plaintext, passphrase)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if bytes.Equal(ciphertext, plaintext) {
+		t.Fatal("ciphertext should differ from plaintext")
+	}
+
+	decrypted, err := DecryptWithPassphrase(ciphertext, passphrase)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !bytes.Equal(decrypted, plaintext) {
+		t.Fatalf("decrypted = %q, want %q", decrypted, plaintext)
+	}
+}
+
+func TestDecryptWithPassphrase_WrongCode(t *testing.T) {
+	ciphertext, _ := EncryptWithPassphrase([]byte("secret"), "correct-code")
+
+	_, err := DecryptWithPassphrase(ciphertext, "wrong-code")
+	if err == nil {
+		t.Fatal("expected error for wrong passphrase")
+	}
+}
+
+func TestDecryptWithPassphrase_TooShort(t *testing.T) {
+	_, err := DecryptWithPassphrase([]byte("tiny"), "code")
+	if err == nil {
+		t.Fatal("expected error for data shorter than salt")
+	}
+}
+
+func TestEncryptWithPassphrase_UniqueSalt(t *testing.T) {
+	plaintext := []byte("same data")
+	passphrase := "same-code"
+
+	c1, _ := EncryptWithPassphrase(plaintext, passphrase)
+	c2, _ := EncryptWithPassphrase(plaintext, passphrase)
+
+	if bytes.Equal(c1, c2) {
+		t.Fatal("same plaintext+passphrase should produce different ciphertext (unique salt)")
+	}
+}
