@@ -14,16 +14,20 @@ import (
 type Data map[string]map[string]string
 
 type Vault struct {
+	dir     string
 	path    string
 	keyPath string
 }
 
 func New(vaultDir string) *Vault {
 	return &Vault{
+		dir:     vaultDir,
 		path:    filepath.Join(vaultDir, "vault.enc"),
 		keyPath: filepath.Join(vaultDir, "key"),
 	}
 }
+
+func (v *Vault) Dir() string { return v.dir }
 
 func (v *Vault) Init() error {
 	if _, err := os.Stat(v.keyPath); err == nil {
@@ -36,6 +40,10 @@ func (v *Vault) Init() error {
 	}
 	if err := SaveKey(v.keyPath, key); err != nil {
 		return err
+	}
+
+	if err := GenerateIdentity(v.dir); err != nil {
+		return fmt.Errorf("generate identity: %w", err)
 	}
 
 	empty := make(Data)

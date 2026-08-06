@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"crypto/ecdh"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -54,6 +55,12 @@ func main() {
 		err = cmdExport(v)
 	case "import-share":
 		err = cmdImportShare(v)
+	case "pubkey":
+		err = cmdPubKey(v)
+	case "add-recipient":
+		err = cmdAddRecipient(v)
+	case "list-recipients":
+		err = cmdListRecipients(v)
 	case "onboard":
 		err = cmdOnboard(v)
 	default:
@@ -80,8 +87,11 @@ Commands:
   sync <project> <target>       Sync to target (github, cloudflare, env)
   sync <dir>                    Sync using .vault.json manifest
   import <project> <.env path>  Import secrets from .env file
-  export <project> [flags]      Export encrypted share file + share code
+  export <project> [flags]      Export encrypted share file
   import-share <file>           Import from a .vault-share file
+  pubkey                        Print your public key
+  add-recipient <name> <key>    Save a recipient's public key
+  list-recipients               List saved recipients
   onboard [dir]                 Auto-detect .env files, import, create .vault.json
 
 Add flags:
@@ -95,18 +105,74 @@ Sync flags:
   --keys KEY1,KEY2              Only sync these keys (default: all)
 
 Export flags:
+  --to <name|pubkey>            Recipient (name from add-recipient, or raw pubkey)
   --keys KEY1,KEY2              Only export these keys
   --out <file>                  Output file (default: <project>.vault-share)
+  (without --to: passphrase mode, prints share code)
 
 Import-share flags:
-  --code XXXX-XXXX-...          Share code (or use --prompt to enter interactively)`)
+  --code XXXX-XXXX-...          Share code for passphrase-mode files
+  (public-key mode files auto-decrypt with your identity)`)
 }
 
 func cmdInit(v *vault.Vault) error {
 	if err := v.Init(); err != nil {
 		return err
 	}
+	pubkey, _ := vault.LoadPublicKey(v.Dir())
 	fmt.Println("Vault initialized at", vaultDir())
+	fmt.Println("Your public key:", pubkey)
+	return nil
+}
+
+func cmdPubKey(v *vault.Vault) error {
+	// Generate identity if it doesn't exist (for vaults created before keypair support)
+	if err := vault.GenerateIdentity(v.Dir()); err != nil {
+		return err
+	}
+	pubkey, err := vault.LoadPublicKey(v.Dir())
+	if err != nil {
+		return err
+	}
+	fmt.Print(pubkey)
+	return nil
+}
+
+func cmdAddRecipient(v *vault.Vault) error {
+	if len(os.Args) < 4 {
+		return fmt.Errorf("usage: vault add-recipient <name> <pubkey>")
+	}
+	name, pubkey := os.Args[2], os.Args[3]
+
+	if _, err := vault.DecodePubKey(pubkey); err != nil {
+		return fmt.Errorf("invalid public key: %w", err)
+	}
+
+	recipients, err := vault.LoadRecipients(v.Dir())
+	if err != nil {
+		return err
+	}
+	recipients[name] = pubkey
+	if err := vault.SaveRecipients(v.Dir(), recipients); err != nil {
+		return err
+	}
+
+	fmt.Printf("Added recipient %s\n", name)
+	return nil
+}
+
+func cmdListRecipients(v *vault.Vault) error {
+	recipients, err := vault.LoadRecipients(v.Dir())
+	if err != nil {
+		return err
+	}
+	if len(recipients) == 0 {
+		fmt.Println("(no recipients)")
+		return nil
+	}
+	for name, key := range recipients {
+		fmt.Printf("%s  %s\n", name, key)
+	}
 	return nil
 }
 
@@ -328,7 +394,7 @@ type SharePayload struct {
 
 func cmdExport(v *vault.Vault) error {
 	if len(os.Args) < 3 {
-		return fmt.Errorf("usage: vault export <project> [--keys KEY1,KEY2] [--out file]")
+		return fmt.Errorf("usage: vault export <project> [--to name|pubkey] [--keys KEY1,KEY2] [--out file]")
 	}
 	project := os.Args[2]
 
@@ -344,29 +410,15 @@ func cmdExport(v *vault.Vault) error {
 		}
 	}
 
-	code, err := vault.GenerateShareCode()
-	if err != nil {
-		return err
-	}
-
 	payload := SharePayload{Project: project, Secrets: secrets}
 	plaintext, err := json.Marshal(payload)
 	if err != nil {
 		return fmt.Errorf("marshal payload: %w", err)
 	}
 
-	ciphertext, err := vault.EncryptWithPassphrase(plaintext, code)
-	if err != nil {
-		return err
-	}
-
 	outFile := flagValue("--out")
 	if outFile == "" {
 		outFile = project + ".vault-share"
-	}
-
-	if err := os.WriteFile(outFile, ciphertext, 0644); err != nil {
-		return fmt.Errorf("write share file: %w", err)
 	}
 
 	keyNames := make([]string, 0, len(secrets))
@@ -375,16 +427,71 @@ func cmdExport(v *vault.Vault) error {
 	}
 	slices.Sort(keyNames)
 
+	toFlag := flagValue("--to")
+	if toFlag != "" {
+		// Public key mode
+		recipientKey, err := resolveRecipient(v, toFlag)
+		if err != nil {
+			return err
+		}
+
+		if err := vault.GenerateIdentity(v.Dir()); err != nil {
+			return err
+		}
+		senderPriv, err := vault.LoadPrivateKey(v.Dir())
+		if err != nil {
+			return err
+		}
+
+		ciphertext, err := vault.EncryptForRecipient(plaintext, senderPriv, recipientKey)
+		if err != nil {
+			return err
+		}
+
+		if err := os.WriteFile(outFile, ciphertext, 0644); err != nil {
+			return fmt.Errorf("write share file: %w", err)
+		}
+
+		fmt.Fprintf(os.Stderr, "Exported %d keys from %s to %s (for %s)\n", len(secrets), project, outFile, toFlag)
+		fmt.Fprintf(os.Stderr, "Keys: %s\n", strings.Join(keyNames, ", "))
+		fmt.Fprintf(os.Stderr, "Recipient decrypts with: vault import-share %s\n", outFile)
+		return nil
+	}
+
+	// Passphrase mode (fallback)
+	code, err := vault.GenerateShareCode()
+	if err != nil {
+		return err
+	}
+
+	ciphertext, err := vault.EncryptWithPassphrase(plaintext, code)
+	if err != nil {
+		return err
+	}
+
+	if err := os.WriteFile(outFile, ciphertext, 0644); err != nil {
+		return fmt.Errorf("write share file: %w", err)
+	}
+
 	fmt.Fprintf(os.Stderr, "Exported %d keys from %s to %s\n", len(secrets), project, outFile)
 	fmt.Fprintf(os.Stderr, "Keys: %s\n", strings.Join(keyNames, ", "))
-	// Share code goes to stdout so Claude can capture it
 	fmt.Print(code)
 	return nil
 }
 
+func resolveRecipient(v *vault.Vault, nameOrKey string) (*ecdh.PublicKey, error) {
+	// Try as a saved recipient name first
+	recipients, _ := vault.LoadRecipients(v.Dir())
+	if pubkey, ok := recipients[nameOrKey]; ok {
+		return vault.DecodePubKey(pubkey)
+	}
+	// Try as a raw public key
+	return vault.DecodePubKey(nameOrKey)
+}
+
 func cmdImportShare(v *vault.Vault) error {
 	if len(os.Args) < 3 {
-		return fmt.Errorf("usage: vault import-share <file.vault-share> [--code XXXX-...] [--prompt]")
+		return fmt.Errorf("usage: vault import-share <file.vault-share> [--code XXXX-...]")
 	}
 	shareFile := os.Args[2]
 
@@ -393,32 +500,49 @@ func cmdImportShare(v *vault.Vault) error {
 		return fmt.Errorf("read share file: %w", err)
 	}
 
-	var code string
-	switch {
-	case flagValue("--code") != "":
-		code = flagValue("--code")
-	case hasFlag("--prompt"):
-		fmt.Fprint(os.Stderr, "Enter share code: ")
-		scanner := bufio.NewScanner(os.Stdin)
-		if scanner.Scan() {
-			code = scanner.Text()
-		}
-	default:
-		// Try stdin
-		stdinData, readErr := io.ReadAll(os.Stdin)
-		if readErr != nil {
-			return fmt.Errorf("read code from stdin: %w", readErr)
-		}
-		code = strings.TrimSpace(string(stdinData))
-	}
+	var plaintext []byte
 
-	if code == "" {
-		return fmt.Errorf("share code required (use --code, --prompt, or pipe to stdin)")
-	}
+	if vault.IsV2ShareFile(data) {
+		// Public key mode — auto-decrypt with our private key
+		privKey, err := vault.LoadPrivateKey(v.Dir())
+		if err != nil {
+			return err
+		}
+		header, pt, err := vault.DecryptFromSender(data, privKey)
+		if err != nil {
+			return fmt.Errorf("decrypt failed — this file may not be for you: %w", err)
+		}
+		plaintext = pt
+		fmt.Fprintf(os.Stderr, "Decrypted share from %s\n", header.Sender)
+	} else {
+		// Passphrase mode — need share code
+		var code string
+		switch {
+		case flagValue("--code") != "":
+			code = flagValue("--code")
+		case hasFlag("--prompt"):
+			fmt.Fprint(os.Stderr, "Enter share code: ")
+			scanner := bufio.NewScanner(os.Stdin)
+			if scanner.Scan() {
+				code = scanner.Text()
+			}
+		default:
+			stdinData, readErr := io.ReadAll(os.Stdin)
+			if readErr != nil {
+				return fmt.Errorf("read code from stdin: %w", readErr)
+			}
+			code = strings.TrimSpace(string(stdinData))
+		}
 
-	plaintext, err := vault.DecryptWithPassphrase(data, code)
-	if err != nil {
-		return fmt.Errorf("invalid share code or corrupted file")
+		if code == "" {
+			return fmt.Errorf("share code required (use --code or --prompt)")
+		}
+
+		pt, err := vault.DecryptWithPassphrase(data, code)
+		if err != nil {
+			return fmt.Errorf("invalid share code or corrupted file")
+		}
+		plaintext = pt
 	}
 
 	var payload SharePayload

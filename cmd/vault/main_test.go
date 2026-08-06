@@ -567,3 +567,142 @@ func TestCLI_SyncManifestWithKeysFilter(t *testing.T) {
 		t.Fatal("DANGEROUS_TOKEN should have been filtered out by manifest keys allowlist")
 	}
 }
+
+func TestCLI_PubKey(t *testing.T) {
+	bin := buildBinary(t)
+	dir := t.TempDir()
+	runVault(t, bin, dir, "init")
+
+	out, err := runVault(t, bin, dir, "pubkey")
+	if err != nil {
+		t.Fatalf("pubkey failed: %s: %v", out, err)
+	}
+	if !strings.HasPrefix(out, "vault1") {
+		t.Fatalf("pubkey should start with vault1: %s", out)
+	}
+}
+
+func TestCLI_AddRecipient_And_List(t *testing.T) {
+	bin := buildBinary(t)
+	dir := t.TempDir()
+	runVault(t, bin, dir, "init")
+
+	// Get our own pubkey to use as a test recipient
+	pubkey, _ := runVault(t, bin, dir, "pubkey")
+
+	out, err := runVault(t, bin, dir, "add-recipient", "alice", pubkey)
+	if err != nil {
+		t.Fatalf("add-recipient failed: %s: %v", out, err)
+	}
+
+	out, err = runVault(t, bin, dir, "list-recipients")
+	if err != nil {
+		t.Fatalf("list-recipients failed: %s: %v", out, err)
+	}
+	if !strings.Contains(out, "alice") {
+		t.Fatalf("alice not in recipients: %s", out)
+	}
+}
+
+func TestCLI_AddRecipient_InvalidKey(t *testing.T) {
+	bin := buildBinary(t)
+	dir := t.TempDir()
+	runVault(t, bin, dir, "init")
+
+	_, err := runVault(t, bin, dir, "add-recipient", "bob", "not-a-valid-key")
+	if err == nil {
+		t.Fatal("expected error for invalid pubkey")
+	}
+}
+
+func TestCLI_PublicKey_ExportImport_RoundTrip(t *testing.T) {
+	bin := buildBinary(t)
+
+	// Sender vault
+	senderDir := t.TempDir()
+	runVault(t, bin, senderDir, "init")
+	runVaultWithStdin(t, bin, senderDir, "secret-for-tomer", "add", "myapp", "API_KEY", "--stdin")
+
+	// Recipient vault
+	recipientDir := t.TempDir()
+	runVault(t, bin, recipientDir, "init")
+	recipientPubkey, _ := runVault(t, bin, recipientDir, "pubkey")
+
+	// Sender adds recipient and exports
+	runVault(t, bin, senderDir, "add-recipient", "tomer", recipientPubkey)
+
+	shareFile := filepath.Join(t.TempDir(), "share.vault-share")
+	out, err := runVault(t, bin, senderDir, "export", "myapp", "--to", "tomer", "--out", shareFile)
+	if err != nil {
+		t.Fatalf("export --to failed: %s: %v", out, err)
+	}
+	if !strings.Contains(out, "for tomer") {
+		t.Fatalf("expected 'for tomer' in output: %s", out)
+	}
+
+	// Recipient imports — no share code needed!
+	out, err = runVault(t, bin, recipientDir, "import-share", shareFile)
+	if err != nil {
+		t.Fatalf("import-share failed: %s: %v", out, err)
+	}
+	if !strings.Contains(out, "Imported 1 keys") {
+		t.Fatalf("unexpected output: %s", out)
+	}
+
+	// Verify secret is in recipient's vault
+	out, _ = runVault(t, bin, recipientDir, "list", "myapp")
+	if !strings.Contains(out, "API_KEY") {
+		t.Fatalf("API_KEY not in recipient vault: %s", out)
+	}
+}
+
+func TestCLI_PublicKey_WrongRecipient(t *testing.T) {
+	bin := buildBinary(t)
+
+	senderDir := t.TempDir()
+	runVault(t, bin, senderDir, "init")
+	runVaultWithStdin(t, bin, senderDir, "secret", "add", "app", "KEY", "--stdin")
+
+	recipientDir := t.TempDir()
+	runVault(t, bin, recipientDir, "init")
+	recipientPubkey, _ := runVault(t, bin, recipientDir, "pubkey")
+
+	wrongDir := t.TempDir()
+	runVault(t, bin, wrongDir, "init")
+
+	// Export to recipient
+	shareFile := filepath.Join(t.TempDir(), "share.vault-share")
+	runVault(t, bin, senderDir, "export", "app", "--to", recipientPubkey, "--out", shareFile)
+
+	// Wrong person tries to import
+	_, err := runVault(t, bin, wrongDir, "import-share", shareFile)
+	if err == nil {
+		t.Fatal("expected error when wrong recipient tries to decrypt")
+	}
+}
+
+func TestCLI_PublicKey_ExportWithKeysFilter(t *testing.T) {
+	bin := buildBinary(t)
+
+	senderDir := t.TempDir()
+	runVault(t, bin, senderDir, "init")
+	runVaultWithStdin(t, bin, senderDir, "val1", "add", "app", "SHARE_ME", "--stdin")
+	runVaultWithStdin(t, bin, senderDir, "val2", "add", "app", "KEEP_PRIVATE", "--stdin")
+
+	recipientDir := t.TempDir()
+	runVault(t, bin, recipientDir, "init")
+	recipientPubkey, _ := runVault(t, bin, recipientDir, "pubkey")
+
+	shareFile := filepath.Join(t.TempDir(), "filtered.vault-share")
+	runVault(t, bin, senderDir, "export", "app", "--to", recipientPubkey, "--keys", "SHARE_ME", "--out", shareFile)
+
+	runVault(t, bin, recipientDir, "import-share", shareFile)
+
+	out, _ := runVault(t, bin, recipientDir, "list", "app")
+	if !strings.Contains(out, "SHARE_ME") {
+		t.Fatal("SHARE_ME should be imported")
+	}
+	if strings.Contains(out, "KEEP_PRIVATE") {
+		t.Fatal("KEEP_PRIVATE should NOT be imported")
+	}
+}
