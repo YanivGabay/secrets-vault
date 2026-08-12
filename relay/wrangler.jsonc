@@ -2,10 +2,11 @@
   "name": "vault-relay",
   "main": "worker.js",
   "compatibility_date": "2025-01-01",
+  "account_id": "7c58acdc8f1a467d915b133062a22fc1",
   "kv_namespaces": [
     {
       "binding": "VAULT_DROPS",
-      "id": ""  // filled in by `vault relay deploy`
+      "id": "0a2c2eada0054cb890f98ed0235f9190"
     }
   ]
 }

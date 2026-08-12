@@ -12,3 +12,4 @@ key
 
 # OS
 .DS_Store
+relay/.wrangler/

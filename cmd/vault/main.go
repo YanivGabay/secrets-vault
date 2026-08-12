@@ -136,7 +136,6 @@ func cmdInit(v *vault.Vault) error {
 }
 
 func cmdPubKey(v *vault.Vault) error {
-	// Generate identity if it doesn't exist (for vaults created before keypair support)
 	if err := vault.GenerateIdentity(v.Dir()); err != nil {
 		return err
 	}
@@ -144,15 +143,56 @@ func cmdPubKey(v *vault.Vault) error {
 	if err != nil {
 		return err
 	}
+
+	if hasFlag("--publish") {
+		config, err := vault.LoadConfig(v.Dir())
+		if err != nil {
+			return err
+		}
+		if config.RelayURL == "" {
+			return fmt.Errorf("no relay configured — run: vault relay set-url <url>")
+		}
+
+		username := flagValue("--as")
+		if username == "" {
+			return fmt.Errorf("usage: vault pubkey --publish --as <username>")
+		}
+
+		if err := vault.PublishPubKey(config.RelayURL, username, pubkey); err != nil {
+			return err
+		}
+		fmt.Fprintf(os.Stderr, "Published as %s\n", username)
+	}
+
 	fmt.Print(pubkey)
 	return nil
 }
 
 func cmdAddRecipient(v *vault.Vault) error {
-	if len(os.Args) < 4 {
-		return fmt.Errorf("usage: vault add-recipient <name> <pubkey>")
+	if len(os.Args) < 3 {
+		return fmt.Errorf("usage: vault add-recipient <name> [pubkey]\n       vault add-recipient <name>  (fetches from relay)")
 	}
-	name, pubkey := os.Args[2], os.Args[3]
+	name := os.Args[2]
+
+	var pubkey string
+	if len(os.Args) >= 4 {
+		pubkey = os.Args[3]
+	} else {
+		// Fetch from relay
+		config, err := vault.LoadConfig(v.Dir())
+		if err != nil {
+			return err
+		}
+		if config.RelayURL == "" {
+			return fmt.Errorf("no relay configured — run: vault relay set-url <url>")
+		}
+		fetched, err := vault.FetchPubKey(config.RelayURL, name)
+		if err != nil {
+			return fmt.Errorf("fetch key for %s: %w", name, err)
+		}
+		pubkey = fetched
+		fmt.Fprintf(os.Stderr, "Fetched key for %s from relay\n", name)
+	}
 
 	if _, err := vault.DecodePubKey(pubkey); err != nil {
 		return fmt.Errorf("invalid public key: %w", err)
@@ -167,7 +207,7 @@ func cmdAddRecipient(v *vault.Vault) error {
 		return err
 	}
 
-	fmt.Printf("Added recipient %s\n", name)
+	fmt.Printf("Added recipient %s (%s)\n", name, pubkey)
 	return nil
 }
 

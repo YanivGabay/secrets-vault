@@ -43,6 +43,46 @@ func SaveConfig(vaultDir string, c *Config) error {
 	return os.WriteFile(filepath.Join(vaultDir, configFile), data, 0600)
 }
 
+// PublishPubKey uploads a public key to the relay's key registry.
+func PublishPubKey(relayURL, username, pubkey string) error {
+	url := strings.TrimRight(relayURL, "/") + "/k/" + username
+	req, err := http.NewRequest("PUT", url, strings.NewReader(pubkey))
+	if err != nil {
+		return err
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("relay unavailable: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 201 {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("publish failed %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	return nil
+}
+
+// FetchPubKey retrieves a public key from the relay's key registry.
+func FetchPubKey(relayURL, username string) (string, error) {
+	url := strings.TrimRight(relayURL, "/") + "/k/" + username
+	resp, err := http.Get(url)
+	if err != nil {
+		return "", fmt.Errorf("relay unavailable: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == 404 {
+		return "", fmt.Errorf("no key published for %q — they need to run: vault pubkey --publish --as %s", username, username)
+	}
+	if resp.StatusCode != 200 {
+		return "", fmt.Errorf("fetch failed %d", resp.StatusCode)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(body)), nil
+}
+
 // DeriveMailbox computes a deterministic mailbox ID from the ECDH shared secret
 // between sender and recipient, bucketed by day for forward privacy.
 func DeriveMailbox(senderPriv *ecdh.PrivateKey, recipientPub *ecdh.PublicKey) (string, error) {
