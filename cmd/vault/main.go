@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/yaniv242/secrets-vault/internal/clipboard"
 	syncpkg "github.com/yaniv242/secrets-vault/internal/sync"
@@ -61,6 +62,12 @@ func main() {
 		err = cmdAddRecipient(v)
 	case "list-recipients":
 		err = cmdListRecipients(v)
+	case "send":
+		err = cmdSend(v)
+	case "receive":
+		err = cmdReceive(v)
+	case "relay":
+		err = cmdRelay(v)
 	case "onboard":
 		err = cmdOnboard(v)
 	default:
@@ -92,6 +99,9 @@ Commands:
   pubkey                        Print your public key
   add-recipient <name> <key>    Save a recipient's public key
   list-recipients               List saved recipients
+  send <project> --to <name>    Dead-drop secrets to a recipient
+  receive                       Check dead-drops and import waiting secrets
+  relay set-url <url>           Set your relay URL
   onboard [dir]                 Auto-detect .env files, import, create .vault.json
 
 Add flags:
@@ -174,6 +184,213 @@ func cmdListRecipients(v *vault.Vault) error {
 		fmt.Printf("%s  %s\n", name, key)
 	}
 	return nil
+}
+
+func cmdSend(v *vault.Vault) error {
+	if len(os.Args) < 3 {
+		return fmt.Errorf("usage: vault send <project> --to <name> [--keys KEY1,KEY2]")
+	}
+	project := os.Args[2]
+	toName := flagValue("--to")
+	if toName == "" {
+		return fmt.Errorf("--to <recipient> is required")
+	}
+
+	config, err := vault.LoadConfig(v.Dir())
+	if err != nil {
+		return err
+	}
+	if config.RelayURL == "" {
+		return fmt.Errorf("no relay configured — run: vault relay set-url <url>")
+	}
+
+	secrets, err := v.GetProject(project)
+	if err != nil {
+		return err
+	}
+
+	if keysFlag := flagValue("--keys"); keysFlag != "" {
+		secrets = syncpkg.FilterKeys(secrets, strings.Split(keysFlag, ","))
+		if len(secrets) == 0 {
+			return fmt.Errorf("no matching keys for filter")
+		}
+	}
+
+	recipientKey, err := resolveRecipient(v, toName)
+	if err != nil {
+		return err
+	}
+
+	if err := vault.GenerateIdentity(v.Dir()); err != nil {
+		return err
+	}
+	senderPriv, err := vault.LoadPrivateKey(v.Dir())
+	if err != nil {
+		return err
+	}
+
+	// Encrypt the payload
+	payload := SharePayload{Project: project, Secrets: secrets}
+	plaintext, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("marshal: %w", err)
+	}
+
+	blob, err := vault.EncryptForRecipient(plaintext, senderPriv, recipientKey)
+	if err != nil {
+		return err
+	}
+
+	// Derive mailbox and send
+	mailbox, err := vault.DeriveMailbox(senderPriv, recipientKey)
+	if err != nil {
+		return err
+	}
+
+	if err := vault.DropSend(config.RelayURL, mailbox, blob); err != nil {
+		return err
+	}
+
+	keyNames := make([]string, 0, len(secrets))
+	for k := range secrets {
+		keyNames = append(keyNames, k)
+	}
+	slices.Sort(keyNames)
+
+	fmt.Printf("Dropped %d keys from %s for %s\n", len(secrets), project, toName)
+	fmt.Printf("Keys: %s\n", strings.Join(keyNames, ", "))
+	fmt.Printf("Burns on pickup, expires in 24h.\n")
+	fmt.Printf("%s just runs: vault receive\n", toName)
+	return nil
+}
+
+func cmdReceive(v *vault.Vault) error {
+	config, err := vault.LoadConfig(v.Dir())
+	if err != nil {
+		return err
+	}
+	if config.RelayURL == "" {
+		return fmt.Errorf("no relay configured — run: vault relay set-url <url>")
+	}
+
+	if err := vault.GenerateIdentity(v.Dir()); err != nil {
+		return err
+	}
+	myPriv, err := vault.LoadPrivateKey(v.Dir())
+	if err != nil {
+		return err
+	}
+
+	recipients, err := vault.LoadRecipients(v.Dir())
+	if err != nil {
+		return err
+	}
+	if len(recipients) == 0 {
+		return fmt.Errorf("no recipients configured — nobody can send you drops")
+	}
+
+	// Check today and yesterday (clock skew tolerance)
+	today := time.Now().UTC().Format("2006-01-02")
+	yesterday := time.Now().UTC().AddDate(0, 0, -1).Format("2006-01-02")
+	dates := []string{today, yesterday}
+
+	found := 0
+	for name, pubkeyStr := range recipients {
+		recipientPub, err := vault.DecodePubKey(pubkeyStr)
+		if err != nil {
+			continue
+		}
+
+		for _, date := range dates {
+			// Derive the mailbox from THEIR perspective (they sent TO us)
+			mailbox, err := vault.DeriveMailboxForDate(myPriv, recipientPub, date)
+			if err != nil {
+				continue
+			}
+
+			blob, err := vault.DropReceive(config.RelayURL, mailbox)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "warning: failed checking drop from %s: %v\n", name, err)
+				continue
+			}
+			if blob == nil {
+				continue
+			}
+
+			// Decrypt
+			_, plaintext, err := vault.DecryptFromSender(blob, myPriv)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "warning: failed decrypting drop from %s: %v\n", name, err)
+				continue
+			}
+
+			var payload SharePayload
+			if err := json.Unmarshal(plaintext, &payload); err != nil {
+				fmt.Fprintf(os.Stderr, "warning: invalid payload from %s: %v\n", name, err)
+				continue
+			}
+
+			count := 0
+			for key, value := range payload.Secrets {
+				if err := v.Add(payload.Project, key, value); err != nil {
+					return fmt.Errorf("import %s: %w", key, err)
+				}
+				count++
+			}
+
+			keyNames := make([]string, 0, len(payload.Secrets))
+			for k := range payload.Secrets {
+				keyNames = append(keyNames, k)
+			}
+			slices.Sort(keyNames)
+
+			fmt.Printf("Pickup from %s: %s (%d keys: %s)\n", name, payload.Project, count, strings.Join(keyNames, ", "))
+			fmt.Println("Imported into vault. Drop burned.")
+			found++
+		}
+	}
+
+	if found == 0 {
+		fmt.Println("No drops waiting.")
+	}
+	return nil
+}
+
+func cmdRelay(v *vault.Vault) error {
+	if len(os.Args) < 3 {
+		return fmt.Errorf("usage: vault relay set-url <url>")
+	}
+
+	switch os.Args[2] {
+	case "set-url":
+		if len(os.Args) < 4 {
+			return fmt.Errorf("usage: vault relay set-url <url>")
+		}
+		url := os.Args[3]
+		config, err := vault.LoadConfig(v.Dir())
+		if err != nil {
+			return err
+		}
+		config.RelayURL = url
+		if err := vault.SaveConfig(v.Dir(), config); err != nil {
+			return err
+		}
+		fmt.Printf("Relay URL set to %s\n", url)
+		return nil
+	case "status":
+		config, err := vault.LoadConfig(v.Dir())
+		if err != nil {
+			return err
+		}
+		if config.RelayURL == "" {
+			fmt.Println("No relay configured")
+			return nil
+		}
+		fmt.Printf("Relay: %s\n", config.RelayURL)
+		return nil
+	default:
+		return fmt.Errorf("unknown relay command: %s (use: set-url, status)", os.Args[2])
+	}
 }
 
 func cmdAdd(v *vault.Vault) error {
