@@ -14,7 +14,8 @@ func (g *GitHub) Name() string { return "github" }
 
 func (g *GitHub) Sync(project string, secrets map[string]string) error {
 	for key, value := range secrets {
-		args := []string{"secret", "set", key, "--body", "-"}
+		// No --body: gh reads the value from stdin. ("--body -" set the literal value "-".)
+		args := []string{"secret", "set", key}
 		if g.Repo != "" {
 			args = append(args, "--repo", g.Repo)
 		}
